@@ -1,0 +1,292 @@
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeoutError
+import re
+import time
+import pandas as pd
+from datetime import date
+
+URL = "https://www.alkosto.com/electrodomesticos/grandes-electrodomesticos/climatizacion/aires-acondicionados/c/BI_A23_ALKOS?sort=relevance"
+
+# --- Expresiones regulares ---
+CAP_RE = re.compile(r"(\d{4,5})\s*,?\s*BTU", re.IGNORECASE)
+MARCA_RE = re.compile(r"(samsung|lg|mabe|olimpo|olimpica|aux|haceb|abaco|finlandek|york|panasonic|hisense|kalley|general electric|marca)", re.IGNORECASE)
+INVERTER_RE = re.compile(r"inverter", re.IGNORECASE)
+ONOFF_RE = re.compile(r"(convencional|on[\s\-]?off)", re.IGNORECASE)
+
+# Refrigerantes comunes (R-32, R-410A, R-22) con variantes de escritura
+REFRIG_RE = re.compile(r"\b(R[\-\s]?32|R[\-\s]?410A|R[\-\s]?22)\b", re.IGNORECASE)
+REFRIG_LABEL_RE = re.compile(r"(refrigerante|gas\s*refrigerante|tipo\s*de\s*refrigerante)", re.IGNORECASE)
+
+CLASE_LETRA_RE = re.compile(r"\bclase\s*([a-e])\b", re.IGNORECASE)
+CLASE_FLEX_RE = re.compile(r"(eficiencia|clasificaci[oó]n|retiq)[^\n:]{0,40}?([a-e])\b", re.IGNORECASE)
+
+def limpiar_precios(txt):
+    if not txt:
+        return None
+    nums = re.sub(r"[^\d]", "", txt)
+    return int(nums) if nums else None
+
+def detectar_tecnologia(titulo):
+    if INVERTER_RE.search(titulo):
+        return "Inverter"
+    if ONOFF_RE.search(titulo):
+        return "Convencional"
+    return "Desconocido"
+
+def normalizar_refrigerante(txt):
+    if not txt:
+        return None
+    m = REFRIG_RE.search(txt)
+    if not m:
+        return None
+    val = m.group(1).upper().replace(" ", "").replace("-", "")
+    # Normalizamos a formato estándar
+    if val in ("R32",):
+        return "R-32"
+    if val in ("R410A",):
+        return "R-410A"
+    if val in ("R22",):
+        return "R-22"
+    return m.group(1).upper()
+
+def buscar_detalle_producto(page, link):
+    """
+    Visita la ficha de producto y retorna:
+    (capacidad_btu, clase_energetica, refrigerante)
+    """
+    capacidad = None
+    clase = None
+    refrigerante = None
+
+    if not link:
+        return capacidad, clase, refrigerante
+
+    try:
+        page.goto(link, timeout=45000)
+        # Esperas suaves para contenido dinámico
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except PwTimeoutError:
+            pass
+        time.sleep(1.5)
+
+        body_txt = page.inner_text("body").lower()
+
+        # Capacidad
+        mcap = CAP_RE.search(body_txt)
+        if mcap:
+            capacidad = mcap.group(1)
+
+        # Clase (solo A-E; no inventar)
+        m1 = CLASE_LETRA_RE.search(body_txt)
+        if m1:
+            letra = m1.group(1).upper()
+            if letra in list("ABCDE"):
+                clase = f"Clase {letra}"
+        if not clase:
+            m2 = CLASE_FLEX_RE.search(body_txt)
+            if m2:
+                letra = m2.group(2).upper()
+                if letra in list("ABCDE"):
+                    clase = f"Clase {letra}"
+
+        # Refrigerante (buscamos por palabra clave y/o patrón directo)
+        # 1) Buscamos línea cercana a "refrigerante"
+        if REFRIG_LABEL_RE.search(body_txt):
+            # Tomar ventana alrededor de "refrigerante"
+            # (simple: si existe, intentamos encontrar el patrón principal en todo el body también)
+            pass
+
+        refrigerante = normalizar_refrigerante(body_txt)
+
+        # A veces Alkosto carga ficha técnica en acordeones; intentamos abrir si existen
+        try:
+            # Expandir posibles acordeones para revelar especificaciones
+            for sel in [
+                "button[aria-controls*='spec'], button:has-text('Ficha técnica')",
+                "button:has-text('Especificaciones')",
+                "button:has-text('Características')",
+                "button.accordion__button"
+            ]:
+                els = page.query_selector_all(sel)
+                for b in els:
+                    try:
+                        if b.is_visible():
+                            b.click()
+                            time.sleep(0.6)
+                    except Exception:
+                        continue
+            # Volvemos a leer el texto con acordeones abiertos
+            body_txt2 = page.inner_text("body").lower()
+            if not capacidad:
+                mcap2 = CAP_RE.search(body_txt2)
+                if mcap2:
+                    capacidad = mcap2.group(1)
+            if not clase:
+                m12 = CLASE_LETRA_RE.search(body_txt2)
+                if m12:
+                    letra = m12.group(1).upper()
+                    if letra in list("ABCDE"):
+                        clase = f"Clase {letra}"
+                else:
+                    m22 = CLASE_FLEX_RE.search(body_txt2)
+                    if m22:
+                        letra = m22.group(2).upper()
+                        if letra in list("ABCDE"):
+                            clase = f"Clase {letra}"
+            if not refrigerante:
+                refrigerante = normalizar_refrigerante(body_txt2)
+        except Exception:
+            pass
+
+    except Exception:
+        # Si algo falla, devolvemos lo que haya
+        return capacidad, clase, refrigerante
+
+    return capacidad, clase, refrigerante
+
+def filename_iso_week(prefix="scraping_alkosto"):
+    iso_week = date.today().isocalendar().week  # semana ISO
+    iso_year = date.today().isocalendar().year  # opcional por unicidad
+    return f"{prefix}_w{iso_week}.xlsx"  # si quieres incluir año: f"{prefix}_{iso_year}_w{iso_week}.xlsx"
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+    page.goto(URL)
+    print("Esperando 7 segundos para carga inicial y popups...")
+    time.sleep(7)
+
+    # Intento de cerrar popups molestos si aparecen
+    for sel in [
+        "button[aria-label='Cerrar']",
+        "button[aria-label='close']",
+        "button:has-text('Cerrar')",
+        "button:has-text('No gracias')"
+    ]:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                el.click()
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+    # Cargar todos los productos (clicks en "Mostrar más productos")
+    clicks = 0
+    while True:
+        btn = page.query_selector("button[data-qa='load-more'], button:has-text('Mostrar más productos'), button.load-more")
+        productos_antes = len(page.query_selector_all("div.product__item__information"))
+        if btn and btn.is_visible():
+            print(f"Haciendo clic en 'Mostrar más productos' ({clicks+1})")
+            try:
+                btn.click()
+            except Exception:
+                page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
+                time.sleep(0.8)
+                try:
+                    btn.click()
+                except Exception:
+                    pass
+            # Esperar incremento de productos
+            for _ in range(30):
+                time.sleep(0.5)
+                productos_despues = len(page.query_selector_all("div.product__item__information"))
+                if productos_despues > productos_antes:
+                    print(f"Productos ahora: {productos_despues}")
+                    break
+            clicks += 1
+        else:
+            print(f"Ya no existe botón 'Mostrar más productos' tras {clicks} clicks.")
+            break
+
+    productos = page.query_selector_all("div.product__item__information")
+    print(f"\nTotal productos encontrados FINAL: {len(productos)}")
+
+    filas = []
+    for idx, prod in enumerate(productos, start=1):
+        a = prod.query_selector("a[href]")
+        titulo = a.get_attribute("title") if a and a.get_attribute("title") else ""
+        if not titulo:
+            img = prod.query_selector("img[alt]")
+            if img:
+                titulo = img.get_attribute("alt") or ""
+        if not titulo:
+            try:
+                titulo = prod.inner_text().strip()
+            except Exception:
+                titulo = ""
+
+        marca = None
+        m = MARCA_RE.search(titulo)
+        if m:
+            marca = m.group(1).upper()
+
+        link = ""
+        if a:
+            link = a.get_attribute("href") or ""
+            if link and not link.startswith("http"):
+                link = "https://www.alkosto.com" + link
+
+        # Tecnología por título
+        tipo_tecnologia = detectar_tecnologia(titulo)
+
+        # Precios
+        precio_normal = None
+        el_prev = prod.query_selector(".price__previous, .price--previous, .product__price__previous")
+        if el_prev:
+            try:
+                precio_normal = limpiar_precios(el_prev.inner_text())
+            except Exception:
+                pass
+
+        precio_descuento = None
+        el_cur = prod.query_selector(".price__normal, .price__current, .price, .product__price")
+        if el_cur:
+            try:
+                precio_descuento = limpiar_precios(el_cur.inner_text())
+            except Exception:
+                pass
+
+        # Detalles en ficha: capacidad, clase, refrigerante (1 sola visita)
+        ficha = context.new_page()
+        capacidad, clase_energetica, refrigerante = buscar_detalle_producto(ficha, link)
+        ficha.close()
+
+        # Si no se encontró capacidad en ficha, intentar en título como respaldo
+        if not capacidad:
+            mcap_t = CAP_RE.search(titulo)
+            if mcap_t:
+                capacidad = mcap_t.group(1)
+
+        filas.append({
+            "Retailer": "Alkosto",
+            "Marca": marca,
+            "Capacidad (BTU)": capacidad,
+            "Tipo de tecnología": tipo_tecnologia,
+            "Precio Normal": precio_normal,
+            "Precio Promoción": precio_descuento,
+            "Clase Eficiencia (RETIQ)": clase_energetica,
+            "Refrigerante": refrigerante,
+            "Título": titulo,
+            "Link": link
+        })
+
+        print(f"[{idx}] Marca: {marca} | Capacidad: {capacidad} | Tec: {tipo_tecnologia} | "
+              f"P.Normal: {precio_normal} | P.Promo: {precio_descuento} | Clase: {clase_energetica} | Refri: {refrigerante}")
+
+    browser.close()
+
+    df = pd.DataFrame(filas)
+
+    # Ordenar columnas como pides (y dejamos las auxiliares al final)
+    cols = ["Retailer", "Capacidad (BTU)", "Marca", "Precio Normal", "Precio Promoción",
+            "Tipo de tecnología", "Clase Eficiencia (RETIQ)", "Refrigerante", "Link", "Título"]
+    # Asegurar que existan
+    cols = [c for c in cols if c in df.columns] + [c for c in df.columns if c not in cols]
+    df = df[cols]
+
+    out_name = filename_iso_week("scraping_alkosto")
+    df.to_excel(out_name, index=False)
+    print(f"\n✅ ¡Datos guardados en {out_name}!")
+
