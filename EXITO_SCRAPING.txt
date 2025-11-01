@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import re
+import time
+import json
+import datetime
+import unicodedata
+import pandas as pd
+from urllib.parse import urlencode
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# ===================== Configuración =====================
+BASE = "https://www.exito.com/s"
+QUERY = "aire acondicionado"
+SORT  = "score_desc"
+
+MAX_PAGES = 40             # tope de seguridad
+WAIT_SECS = 20             # espera para que carguen tarjetas
+WAIT_PDP_SECS = 14         # espera para PDP
+PAUSE_MIN, PAUSE_MAX = 1.0, 2.0    # pausa entre páginas
+PDP_PAUSE = (0.8, 1.4)             # pausa breve entre PDPs
+EXTRACT_PDP_FOR_ALL = True         # visitar cada PDP para enriquecer
+
+# Selectores de la vitrina (según HTML actual)
+SEL_CARD      = "article.productCard_productCard__M0677"
+SEL_LINK      = 'a[data-testid="product-link"][href*="/p"]'
+SEL_NAME      = "h3.styles_name__qQJiK"
+SEL_BRAND     = "h3.styles_brand__IdJcB"
+SEL_PRICE_LP  = "p.priceSection_container-promotion_price-dashed__FJ7nI"  # lista/tachado
+SEL_PRICE_PR  = "p.ProductPrice_container__price__XmMWA"                   # precio vigente
+
+# ===================== Helpers =====================
+CAP_RE  = re.compile(r"(\d{3,5}|\d{2}\.?0?00)\s*BTU", re.IGNORECASE)
+INV_RE  = re.compile(r"\b(inverter|inv\.?)\b", re.IGNORECASE)
+# SOLO A-E (lo que pediste). Si no aparece, lo dejamos vacío.
+RETIQ_GRADE_RE = re.compile(r"\b([A-E])\b", re.IGNORECASE)
+RETIQ_LINE_RE  = re.compile(r"clasificaci[oó]n\s*retiq[^A-Za-z0-9]*([A-E])", re.IGNORECASE)
+
+def parse_money(txt: str):
+    if not txt: return None
+    digits = re.sub(r"[^\d]", "", txt)
+    return float(digits) if digits else None
+
+def infer_capacity_from_text(txt: str | None):
+    if not txt: return None
+    m = CAP_RE.search(txt)
+    if not m: return None
+    return re.sub(r"[^\d]", "", m.group(1))
+
+def infer_tech(name: str | None):
+    if not name: return None
+    return "Inverter" if INV_RE.search(name) else "Convencional"
+
+def url_for_page(page: int) -> str:
+    return f"{BASE}?{urlencode({'q': QUERY, 'sort': SORT, 'page': page})}"
+
+def mid_pause(a, b):  # pausa promedio
+    time.sleep((a + b) / 2.0)
+
+def norm(s: str | None) -> str:
+    if s is None: return ""
+    return unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii").lower().strip()
+
+def pick_retiq(value_str: str | None) -> str | None:
+    if not value_str: return None
+    m = RETIQ_GRADE_RE.search(value_str)
+    return m.group(1).upper() if m else None
+
+# ============ XPaths para abrir secciones de especificaciones (si están colapsadas) ============
+SPEC_TOGGLE_XPATHS = [
+    "//button[contains(translate(., 'ÁÉÍÓÚÑABCDEFGHIJKLMNOPQRSTUVWXYZ', 'aeiouñabcdefghijklmnopqrstuvwxyz'), 'especific')]",
+    "//button[contains(translate(., 'ÁÉÍÓÚÑABCDEFGHIJKLMNOPQRSTUVWXYZ', 'aeiouñabcdefghijklmnopqrstuvwxyz'), 'caracter')]",
+    "//summary[contains(translate(., 'ÁÉÍÓÚÑABCDEFGHIJKLMNOPQRSTUVWXYZ', 'aeiouñabcdefghijklmnopqrstuvwxyz'), 'especific')]",
+    "//div[@role='button'][contains(translate(., 'ÁÉÍÓÚÑABCDEFGHIJKLMNOPQRSTUVWXYZ', 'aeiouñabcdefghijklmnopqrstuvwxyz'), 'especific')]",
+]
+
+def open_spec_sections(driver: webdriver.Chrome, wait: WebDriverWait):
+    try:
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except Exception:
+        return
+    for xp in SPEC_TOGGLE_XPATHS:
+        try:
+            for el in driver.find_elements(By.XPATH, xp)[:3]:
+                try:
+                    if el.is_displayed():
+                        el.click()
+                        time.sleep(0.3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+# ===================== JSON-LD de la PDP =====================
+def extract_from_ldjson(html: str):
+    """
+    Devuelve dict con: {'retiq': 'A'..'E', 'refrigerante': 'R-410A', 'capacity_btu': '12000'}
+    Busca <script type="application/ld+json">…</script> (sin bs4, usando regex).
+    Recorre objetos con 'properties' al estilo VTEX.
+    """
+    out = {"retiq": None, "refrigerante": None, "capacity_btu": None}
+
+    # Extrae todos los bloques JSON-LD
+    scripts = re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, flags=re.IGNORECASE | re.DOTALL
+    )
+    def walk(o):
+        if isinstance(o, dict):
+            # Lista de propiedades normalizada VTEX
+            props = o.get("properties")
+            if isinstance(props, list):
+                for p in props:
+                    pname = norm(p.get("name") or p.get("originalName") or "")
+                    vals  = p.get("values") or []
+                    val_text = " ".join(str(v) for v in vals)
+
+                    if "retiq" in pname:
+                        g = pick_retiq(val_text) or pick_retiq(pname)
+                        out["retiq"] = g  # Solo A-E; si no hay, queda None
+
+                    elif "refrigerante" in pname:
+                        out["refrigerante"] = (val_text or "").strip() or None
+
+                    elif "capacidad" in pname and ("btu" in norm(val_text) or "btu" in pname):
+                        cap = infer_capacity_from_text(val_text)
+                        if cap:
+                            out["capacity_btu"] = cap
+
+            # seguir recorriendo
+            for v in o.values():
+                walk(v)
+
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for txt in scripts:
+        txt = (txt or "").strip()
+        if not txt:
+            continue
+        # Algunos scripts traen varios JSON concatenados; intenta parsear robusto
+        candidates = []
+        try:
+            candidates.append(json.loads(txt))
+        except Exception:
+            # Intenta separar objetos si hay más de uno pegado
+            for m in re.finditer(r'\{.*?\}', txt, flags=re.DOTALL):
+                try:
+                    candidates.append(json.loads(m.group(0)))
+                except Exception:
+                    pass
+        for data in candidates:
+            walk(data)
+
+    # Último recurso: regex sobre todo el HTML (solo A-E)
+    if not out["retiq"]:
+        m = RETIQ_LINE_RE.search(html)
+        if m:
+            out["retiq"] = m.group(1).upper()
+
+    # Si aún no hay capacidad, intenta regex amplia
+    if not out["capacity_btu"]:
+        m = re.search(r"capacidad[^<>{}\n\r]*?(\d[\d\.]*)\s*bt[uú]", html, re.IGNORECASE)
+        if m:
+            out["capacity_btu"] = re.sub(r"[^\d]", "", m.group(1))
+
+    return out
+
+# ===================== Scraper principal (Selenium Manager) =====================
+def scrape_exito_with_selenium(headless: bool = False):
+    chrome_opts = Options()
+    if headless:
+        chrome_opts.add_argument("--headless=new")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-gpu")
+    chrome_opts.add_argument("--window-size=1366,900")
+    chrome_opts.add_argument("--lang=es-ES,es")
+    chrome_opts.add_argument("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+    # Selenium Manager resuelve el driver correcto automáticamente
+    driver = webdriver.Chrome(options=chrome_opts)
+    wait = WebDriverWait(driver, WAIT_SECS)
+
+    rows, seen_links = [], set()
+
+    try:
+        # 1) Recorrer la vitrina
+        for page in range(MAX_PAGES):
+            url = url_for_page(page)
+            print(f"→ page {page}: {url}")
+            driver.get(url)
+
+            # Cierra pop-ups básicos si aparecen (tolerante)
+            for sel in ["button[aria-label*='cerrar']", "button[aria-label*='Close']"]:
+                try:
+                    driver.find_element(By.CSS_SELECTOR, sel).click()
+                    break
+                except Exception:
+                    pass
+
+            try:
+                wait.until(EC.any_of(
+                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, SEL_CARD)),
+                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, SEL_LINK))
+                ))
+            except Exception:
+                print("  ℹ️ sin tarjetas visibles; fin.")
+                break
+
+            cards = driver.find_elements(By.CSS_SELECTOR, SEL_CARD)
+            if not cards:
+                links = driver.find_elements(By.CSS_SELECTOR, SEL_LINK)
+                if not links:
+                    print("  ℹ️ sin productos; fin.")
+                    break
+                cards = []
+                for l in links:
+                    try:
+                        cards.append(l.find_element(By.XPATH, "./ancestor::article"))
+                    except Exception:
+                        pass
+
+            nuevos = 0
+            for card in cards:
+                try:
+                    link_el = card.find_element(By.CSS_SELECTOR, SEL_LINK)
+                    href = link_el.get_attribute("href") or ""
+                    if not href:
+                        continue
+                    if not href.startswith("http"):
+                        href = "https://www.exito.com" + href
+                    if href in seen_links:
+                        continue
+
+                    # nombre y marca
+                    try:
+                        name = card.find_element(By.CSS_SELECTOR, SEL_NAME).text.strip()
+                    except Exception:
+                        name = link_el.text.strip()
+                    try:
+                        brand = card.find_element(By.CSS_SELECTOR, SEL_BRAND).text.strip()
+                    except Exception:
+                        brand = None
+
+                    # precios
+                    list_txt = promo_txt = None
+                    try:
+                        list_txt = card.find_element(By.CSS_SELECTOR, SEL_PRICE_LP).text.strip()
+                    except Exception:
+                        pass
+                    try:
+                        promo_txt = card.find_element(By.CSS_SELECTOR, SEL_PRICE_PR).text.strip()
+                    except Exception:
+                        pass
+
+                    lp = parse_money(list_txt)
+                    pr = parse_money(promo_txt)
+
+                    # enriquecer básico con el nombre
+                    cap  = infer_capacity_from_text(name)
+                    tech = infer_tech(name)
+
+                    rows.append({
+                        "Retailer": "exito",
+                        "Marca": brand,
+                        "Capacidad (BTU)": cap,             # puede sobrescribirse con PDP
+                        "Tecnología": tech,
+                        "Clasificación RETIQ": None,         # se llena con PDP
+                        "Refrigerante": None,                # se llena con PDP
+                        "Precio Regular": lp,
+                        "Precio Promo": pr,
+                        "Link": href
+                    })
+                    seen_links.add(href)
+                    nuevos += 1
+                except Exception:
+                    continue
+
+            print(f"   {len(cards)} tarjetas; {nuevos} nuevas (acum={len(rows)})")
+            if nuevos == 0:
+                print("  ℹ️ sin nuevos; fin.")
+                break
+
+            mid_pause(PAUSE_MIN, PAUSE_MAX)
+
+        # 2) Enriquecer con RETIQ + Refrigerante + Capacidad desde PDP
+        if EXTRACT_PDP_FOR_ALL and rows:
+            print(f"\n🔎 Enriqueciendo desde PDP (RETIQ / Refrigerante / Capacidad) en {len(rows)} productos…")
+            main_window = driver.current_window_handle
+            for i, row in enumerate(rows, 1):
+                try:
+                    href = row["Link"]
+                    driver.switch_to.new_window('tab')
+                    driver.get(href)
+
+                    # abre secciones de especificaciones si están colapsadas
+                    open_spec_sections(driver, WebDriverWait(driver, WAIT_PDP_SECS))
+
+                    # lee JSON-LD / DOM (regex)
+                    html = driver.page_source
+                    enrich = extract_from_ldjson(html)
+
+                    if enrich.get("retiq"):
+                        row["Clasificación RETIQ"] = enrich["retiq"]  # A..E
+                    if enrich.get("refrigerante"):
+                        row["Refrigerante"] = enrich["refrigerante"]
+                    if enrich.get("capacity_btu"):
+                        row["Capacidad (BTU)"] = enrich["capacity_btu"]
+
+                    driver.close()
+                    driver.switch_to.window(main_window)
+
+                    mid_pause(*PDP_PAUSE)
+                    if i % 10 == 0:
+                        print(f"   …{i} PDP procesadas")
+                except Exception:
+                    try:
+                        driver.close()
+                        driver.switch_to.window(main_window)
+                    except Exception:
+                        pass
+                    continue
+
+    finally:
+        driver.quit()
+
+    # 3) Filtrar: excluir productos sin capacidad o con capacidad 0
+    clean_rows = []
+    for r in rows:
+        cap = r.get("Capacidad (BTU)")
+        cap_num = int(cap) if (cap and str(cap).isdigit()) else 0
+        if cap_num > 0:
+            clean_rows.append(r)
+
+    df = pd.DataFrame(clean_rows)
+    if df.empty:
+        print("⚠️ No se extrajeron productos con capacidad válida.")
+        return df
+
+    # normaliza precios
+    for c in ["Precio Regular", "Precio Promo"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # fuerza RETIQ a A–E o None (por seguridad)
+    df["Clasificación RETIQ"] = df["Clasificación RETIQ"].apply(
+        lambda x: x if isinstance(x, str) and x.upper() in {"A","B","C","D","E"} else None
+    )
+
+    # orden de columnas
+    df = df[[
+        "Retailer","Marca","Capacidad (BTU)","Tecnología",
+        "Clasificación RETIQ","Refrigerante","Precio Regular","Precio Promo","Link"
+    ]]
+
+    # exporta con semana ISO
+    week = datetime.date.today().isocalendar().week
+    out = f"scraping_exito_w{week}.xlsx"
+    df.to_excel(out, index=False)
+    print(f"\n✅ Exportado {len(df)} filas → {out}")
+    return df
+
+
+if __name__ == "__main__":
+    # pon True si quieres headless
+    scrape_exito_with_selenium(headless=False)
